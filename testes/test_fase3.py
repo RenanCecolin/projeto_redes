@@ -14,8 +14,8 @@ import os
 
 # Ajusta caminho para importar os módulos da fase3
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'fase3')))
-from tcp_server import main as server_main
-from tcp_client import main as client_main
+from fase3.tcp_server import main as server_main
+from fase3.tcp_client import main as client_main
 
 
 if __name__ == "__main__":

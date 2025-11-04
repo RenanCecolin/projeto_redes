@@ -180,7 +180,10 @@ class RDT20Receiver:
         """
         try:
             while self.running:
-                packet, addr = self.sock.recvfrom(65536)
+                try:
+                    packet, addr = self.sock.recvfrom(65536)
+                except OSError:
+                    break
                 try:
                     ptype, cs, data = parse_packet(packet)
                 except Exception as e:
