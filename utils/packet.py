@@ -73,3 +73,11 @@ def parse_packet(packet: bytes):
         'payload': payload,
         'corrupt': corrupt
     }
+
+def extract(pkt_bytes):
+    """Compatível com o formato antigo: retorna o dicionário parseado"""
+    return parse_packet(pkt_bytes)
+
+def is_corrupt(pkt):
+    """Retorna True se o pacote estiver corrompido"""
+    return pkt.get('corrupt', True)

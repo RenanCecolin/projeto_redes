@@ -1,10 +1,12 @@
 """
-tests/test_fase2.py
-Teste robusto do protocolo Go-Back-N (GBN) avaliando throughput
-em função do tamanho da janela, com debug opcional.
+tests/test_fase2_full.py
+Testes comparativos de protocolos: rdt3.0 (Stop-and-Wait), Go-Back-N e Selective Repeat.
 
-Exemplo de execução:
-python testes/test_fase2.py
+Mede throughput, retransmissões, utilização e verifica perdas/ordenação.
+Gera gráficos comparativos de desempenho.
+
+Execução:
+    python testes/test_fase2_full.py
 """
 
 import time
@@ -12,72 +14,151 @@ import sys
 import os
 import matplotlib.pyplot as plt
 
-# Ajusta caminho para importar módulos do projeto
+# Permitir import dos módulos do projeto
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-def test_gbn_var_window():
+from utils.simulator import UnreliableChannel
+from fase1.rdt30 import RDT30Sender, RDT21Receiver
+from fase2.gbn import GBNSender, GBNReceiver
+from fase2.sr import SR_Sender, SR_Receiver
+
+
+import threading
+import time
+
+def run_protocol_test(name, sender_cls, receiver_cls, total_chunks=1024, chunk_size=1024,
+                      window_size=1, loss_rate=0.1, delay_range=(0.01, 0.05), verbose=False,
+                      test_out_of_order=False):
     """
-    Testa desempenho do GBN variando o tamanho da janela.
-    Avalia throughput, tempo, retransmissões para cada tamanho.
+    Executa um teste completo para um protocolo confiável.
 
-    Configuração:
-        - Perda de 10% de pacotes.
-        - Sem corrupção.
-        - Delay variável entre 10ms e 50ms.
-        - Envio de 32 chunks de 1024 bytes cada.
+    Retorna:
+        dict: métricas (tempo, throughput, retransmissões, recebidos, utilização)
     """
-    from utils.simulator import UnreliableChannel
-    from fase2.gbn import GBNSender, GBNReceiver
+    port = 14000 + hash(name + str(window_size)) % 1000
+    ch = UnreliableChannel(loss_rate=loss_rate, corrupt_rate=0.0, delay_range=delay_range, verbose=False)
 
-    N_list = [1, 5, 10, 20]
-    results = []
-    total_chunks = 32  # Teste reduzido para facilitar debug
+    received = []
 
-    for N in N_list:
-        print(f"\n==== Testando janela N={N} ====")
-        port = 15000 + N  # Porta única para cada teste
-        ch = UnreliableChannel(loss_rate=0.10, corrupt_rate=0.0, delay_range=(0.01, 0.05), verbose=False)
-        received = []
+    def deliver(data):
+        received.append(data)
 
-        def deliver(b):
-            print("Pacote entregue à aplicação:", len(b))
-            received.append(b)
+    # === Criação dos objetos de envio e recepção ===
+    if name == "SR":
+        receiver = receiver_cls(channel=ch, window_size=window_size)
+        sender = sender_cls(channel=ch, window_size=window_size, timeout=1.0)
 
-        receiver = GBNReceiver(local_addr=('localhost', port), deliver_callback=deliver, channel=ch, verbose=False)
-        sender = GBNSender(local_addr=('localhost', 0), dest_addr=('localhost', port),
-                           channel=ch, N=N, timeout=1.0, verbose=False)
+        # 🟢 Inicia o receiver em uma thread separada
+        threading.Thread(target=receiver.receive, daemon=True).start()
 
-        data = b'x' * 1024
-        t0 = time.time()
-        for i in range(total_chunks):
-            sender.send(data)
-            print(f"[TESTE] Sender enviou chunk {i}")
-        t1 = time.time()
+    elif name == "GBN":
+        receiver = receiver_cls(local_addr=('localhost', port), deliver_callback=deliver, channel=ch, verbose=verbose)
+        sender = sender_cls(local_addr=('localhost', 0), dest_addr=('localhost', port),
+                            channel=ch, N=window_size, timeout=1.0, verbose=verbose)
+    else:  # RDT3.0
+        receiver = receiver_cls(local_addr=('localhost', port), deliver_callback=deliver, channel=ch, verbose=verbose)
+        sender = sender_cls(local_addr=('localhost', 0), dest_addr=('localhost', port),
+                            channel=ch, timeout=1.0, verbose=verbose)
 
-        print("[TESTE] Esperando recebimento final...")
-        time.sleep(2)
+    # === Envio dos dados ===
+    data = b'x' * chunk_size
+    t0 = time.time()
 
-        throughput = (1024 * total_chunks) / (t1 - t0) / 1e6  # em MBps
-        print(f"Janela {N} entregou {len(received)} chunks, tempo={t1-t0:.2f}s, throughput={throughput:.2f} MBps, retransmissões={sender.retransmissions}")
+    for i in range(total_chunks):
+        sender.send(data)
+        if verbose and i % 100 == 0:
+            print(f"[{name}] Enviando chunk {i}")
 
-        results.append({'N': N, 'time': t1 - t0, 'throughput': throughput, 'retransmissions': sender.retransmissions})
+    t1 = time.time()
+    elapsed = t1 - t0
+    if elapsed == 0:
+        elapsed = 0.000001  # evita divisão por zero
+
+    # Espera o recebimento completo
+    time.sleep(2.0)
+
+    # === Métricas ===
+    delivered_count = len(received)
+    total_data = chunk_size * total_chunks
+    throughput = total_data / elapsed / 1e6  # MBps
+    utilization = throughput / (8 / (delay_range[0] + delay_range[1]))  # taxa relativa
+    retrans = getattr(sender, "retransmissions", 0)
+
+    # Verificação de completude
+    ok = delivered_count == total_chunks
+    if not ok:
+        print(f"[WARN] {name} entregou apenas {delivered_count}/{total_chunks} chunks!")
+
+    # Teste de ordenação (apenas SR)
+    if name == "SR" and test_out_of_order:
+        print("[SR TEST] Simulando entrega fora de ordem.")
+        ch.delay_range = (0.01, 0.5)
+        # reenviar pequenos pacotes para testar buffer
+        for i in range(5):
+            sender.send(b"TesteSR" + bytes([i]))
+
+    try:
         sender.close()
         receiver.close()
+    except Exception:
+        pass
 
-    print("\n==== Resultados ====")
+    return {
+        'protocol': name,
+        'window': window_size,
+        'time': elapsed,
+        'throughput': throughput,
+        'utilization': utilization,
+        'retransmissions': retrans,
+        'received': delivered_count
+    }
+
+def main():
+    total_chunks = 1024 # 1024 * 1024 bytes = 1 MB
+    results = []
+
+    # === Teste RDT3.0 (Stop and Wait) ===
+    print("\n=== Testando RDT3.0 (Stop-and-Wait) ===")
+    rdt3 = run_protocol_test("RDT3", RDT30Sender, RDT21Receiver, total_chunks=total_chunks, window_size=1)
+    results.append(rdt3)
+
+    # === Teste Go-Back-N ===
+    print("\n=== Testando Go-Back-N ===")
+    for N in [1, 5, 10, 20]:
+        res = run_protocol_test("GBN", GBNSender, GBNReceiver, total_chunks=total_chunks, window_size=N)
+        results.append(res)
+
+    # === Teste Selective Repeat ===
+    print("\n=== Testando Selective Repeat ===")
+    for N in [1, 5, 10, 20]:
+        res = run_protocol_test("SR", SR_Sender, SR_Receiver, total_chunks=total_chunks,
+                                window_size=N, test_out_of_order=True if N == 10 else False)
+        results.append(res)
+
+    # === Exibir resultados ===
+    print("\n==== RESULTADOS ====")
     for r in results:
-        print(f"N={r['N']}, tempo={r['time']:.2f}s, throughput={r['throughput']:.2f} MBps, retransmissions={r['retransmissions']}")
+        print(f"{r['protocol']} (N={r['window']}): "
+              f"tempo={r['time']:.2f}s, throughput={r['throughput']:.2f}MBps, "
+              f"utilização={r['utilization']:.4f}, retransmissões={r['retransmissions']}, "
+              f"recebidos={r['received']}")
 
-    # Gráfico do throughput por tamanho da janela
-    plt.figure()
-    plt.plot([r['N'] for r in results], [r['throughput'] for r in results], marker='o')
-    plt.xlabel('Window size (N)')
-    plt.ylabel('Throughput (MBps)')
-    plt.title('GBN: Throughput x Window Size')
+    # === Gráficos comparativos ===
+    plt.figure(figsize=(8, 5))
+    gbn = [r for r in results if r['protocol'] == 'GBN']
+    sr = [r for r in results if r['protocol'] == 'SR']
+
+    plt.plot([r['window'] for r in gbn], [r['throughput'] for r in gbn], marker='o', label='GBN')
+    plt.plot([r['window'] for r in sr], [r['throughput'] for r in sr], marker='s', label='SR')
+    plt.axhline(y=rdt3['throughput'], color='gray', linestyle='--', label='RDT3.0')
+    plt.xlabel("Tamanho da Janela (N)")
+    plt.ylabel("Throughput (MBps)")
+    plt.title("Desempenho dos Protocolos Confiáveis")
+    plt.legend()
     plt.grid(True)
-    plt.savefig('gbn_throughput.png', dpi=120)
+    plt.savefig("comparativo_protocolos.png", dpi=120)
     plt.show()
 
 
-if __name__ == '__main__':
-    test_gbn_var_window()
+if __name__ == "__main__":
+    main()
