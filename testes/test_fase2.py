@@ -1,12 +1,8 @@
 """
-tests/test_fase2_full.py
 Testes comparativos de protocolos: rdt3.0 (Stop-and-Wait), Go-Back-N e Selective Repeat.
 
 Mede throughput, retransmissões, utilização e verifica perdas/ordenação.
 Gera gráficos comparativos de desempenho.
-
-Execução:
-    python testes/test_fase2_full.py
 """
 
 import time
