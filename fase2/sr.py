@@ -4,160 +4,167 @@ import time
 from utils.packet import make_packet, parse_packet, is_corrupt, TYPE_DATA, TYPE_ACK
 from utils.simulator import sendto_via_channel
 
-TIMEOUT = 2.0
-
-def seq_in_range(seq, start, end, max_seq):
+def seq_in_range(seq, start, end, max_seq=256):
     """Verifica se um número de sequência está dentro da janela circular."""
     if start <= end:
         return start <= seq < end
     else:
         return seq >= start or seq < end
 
-
+# ===================== Sender =====================
 class SR_Sender:
-    def __init__(self, sender_addr=('localhost', 12000), receiver_addr=('localhost', 12001),
-                 channel=None, window_size=4, timeout=TIMEOUT):
-        self.sender_addr = sender_addr
-        self.receiver_addr = receiver_addr
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(sender_addr)
-
+    def __init__(self, channel, window_size=4, timeout=1.0,
+                 local_addr=('localhost', 0), dest_addr=None):
         self.channel = channel
         self.window_size = window_size
         self.timeout = timeout
+        self.dest_addr = dest_addr
 
+        # Socket UDP
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(local_addr)
+        self.sock.settimeout(0.2)
+
+        # Controle de janela
         self.base = 0
-        self.next_seq = 0
+        self.next_seq_num = 0
+        self.buffer = {}  # seq -> packet
+        self.timers = {}  # seq -> start_time
+        self.acks = {}    # seq -> bool
+        self.retransmissions = 0
+
         self.lock = threading.Lock()
-        self.buffer = {}          # pacotes não confirmados
-        self.acked = {}           # flags de ACK
-        self.total_chunks = 0
+        self.stop_event = threading.Event()
+
+        # Thread para receber ACKs
+        self.recv_thread = threading.Thread(target=self._receive_acks, daemon=True)
+        self.recv_thread.start()
 
     def send(self, data_chunks):
-        self.total_chunks = len(data_chunks)
-        recv_thread = threading.Thread(target=self._receive_acks, daemon=True)
-        recv_thread.start()
+        for data in data_chunks:
+            if isinstance(data, int):
+                data = data.to_bytes(4, 'big')
+            elif isinstance(data, str):
+                data = data.encode()
 
-        while self.base < self.total_chunks:
+            sent = False
+            while not sent:
+                with self.lock:
+                    if len(self.buffer) < self.window_size:
+                        seq = self.next_seq_num % 256
+                        pkt = make_packet(TYPE_DATA, seq, data)
+                        sendto_via_channel(self.sock, pkt, self.dest_addr, self.channel)
+                        self.buffer[seq] = pkt
+                        self.timers[seq] = time.time()
+                        self.acks[seq] = False
+                        self.next_seq_num += 1
+                        sent = True
+                self._check_timeouts()
+                time.sleep(0.01)
+
+        # Espera todos os ACKs
+        while True:
             with self.lock:
-                # Envia pacotes dentro da janela
-                while seq_in_range(self.next_seq % 256,
-                                self.base % 256,
-                                (self.base + self.window_size) % 256,
-                                256) and (self.next_seq < self.total_chunks):
-                    payload = data_chunks[self.next_seq]
-                    if isinstance(payload, str):
-                        payload = payload.encode()
-                    elif isinstance(payload, int):
-                        payload = str(payload).encode()
-                    elif payload is None:
-                        payload = b""
-
-                    # Apenas o campo do pacote usa %256
-                    pkt = make_packet(TYPE_DATA, self.next_seq % 256, payload)
-                    self.buffer[self.next_seq] = pkt
-                    print(f"[SR_Sender] Enviando pacote {self.next_seq}.")
-                    sendto_via_channel(self.sock, pkt, self.receiver_addr, self.channel)
-                    self._start_timer(self.next_seq)
-                    self.next_seq += 1  # sem módulo aqui
-
+                if not self.buffer:
+                    break
+            self._check_timeouts()
             time.sleep(0.05)
 
-        # Espera todos ACKs
-        while self.base < self.total_chunks:
-            time.sleep(0.05)
-        print("[SR_Sender] Todos os pacotes foram enviados e confirmados.")
-
-    def _start_timer(self, seq):
-        t = threading.Thread(target=self._timeout_thread, args=(seq,), daemon=True)
-        t.start()
-
-    def _timeout_thread(self, seq):
-        time.sleep(self.timeout)
+    def _check_timeouts(self):
         with self.lock:
-            if seq not in self.acked:
-                print(f"[SR_Sender] Timeout seq={seq}, retransmitindo.")
-                pkt = self.buffer[seq]
-                sendto_via_channel(self.sock, pkt, self.receiver_addr, self.channel)
-                self._start_timer(seq)
+            for seq in list(self.buffer.keys()):
+                if not self.acks[seq] and time.time() - self.timers[seq] > self.timeout:
+                    sendto_via_channel(self.sock, self.buffer[seq], self.dest_addr, self.channel)
+                    self.timers[seq] = time.time()
+                    self.retransmissions += 1
 
     def _receive_acks(self):
-        while True:
+        while not self.stop_event.is_set():
             try:
-                pkt_bytes, _ = self.sock.recvfrom(2048)
-            except OSError:
-                break
-
-            pkt = parse_packet(pkt_bytes)
-            if not pkt or is_corrupt(pkt):
+                ack_pkt, _ = self.sock.recvfrom(2048)
+            except (socket.timeout, OSError):
                 continue
-            if pkt['type'] == TYPE_ACK:
-                ack_mod = pkt['seq']
 
+            pkt = parse_packet(ack_pkt)
+            if pkt and pkt["type"] == TYPE_ACK:
+                ack_seq = pkt["seq"]
                 with self.lock:
-                    # Procura qual seq lógico corresponde a esse ack_mod
-                    # Encontrar o pacote mais recente com mesmo número mod 256
-                    matches = [seq for seq in self.buffer.keys() if seq % 256 == ack_mod]
-                    if matches:
-                        seq = max(matches)  # sempre pega o mais novo (ex: 256 em vez de 0)
-                        self.acked[seq] = True
-                        print(f"[SR_Sender] ACK recebido {seq} (mod={ack_mod}).")
+                    if ack_seq in self.buffer:
+                        self.acks[ack_seq] = True
+                        del self.buffer[ack_seq]
+                        del self.timers[ack_seq]
 
-                        # Atualiza base
-                        while self.base in self.acked and self.acked[self.base]:
-                            self.base += 1
+    def close(self):
+        self.stop_event.set()
+        time.sleep(0.2)
+        try:
+            self.sock.close()
+        except Exception:
+            pass
 
-                    # Atualiza base
-                    while self.base in self.acked and self.acked[self.base]:
-                        self.base += 1
-
-
+# ===================== Receiver =====================
 class SR_Receiver:
-    def __init__(self, sender_addr=('localhost', 12000), receiver_addr=('localhost', 12001),
-                 channel=None, window_size=4):
-        self.sender_addr = sender_addr
-        self.receiver_addr = receiver_addr
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(receiver_addr)
-
+    def __init__(self, channel, window_size=4,
+                 local_addr=('localhost', 0), sender_addr=None,
+                 deliver_callback=None):
         self.channel = channel
         self.window_size = window_size
+        self.deliver_callback = deliver_callback
+        self.sender_addr = sender_addr
+
+        # Socket UDP
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(local_addr)
+        self.sock.settimeout(0.2)
+
         self.expected_seq = 0
-        self.buffer = {}
+        self.buffer = {}  # seq -> payload
         self.delivered_data = []
 
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self.receive, daemon=True)
+        self.thread.start()
+
     def receive(self):
-        while True:
-            pkt_bytes, addr = self.sock.recvfrom(2048)
+        while not self.stop_event.is_set():
+            try:
+                pkt_bytes, addr = self.sock.recvfrom(2048)
+            except (socket.timeout, OSError):
+                continue
+
             pkt = parse_packet(pkt_bytes)
             if not pkt or is_corrupt(pkt):
                 continue
+
             if pkt['type'] == TYPE_DATA:
-                seq_mod = pkt['seq']
+                seq = pkt['seq']
                 data = pkt['payload']
 
-                # Envia ACK
-                ack_pkt = make_packet(TYPE_ACK, seq_mod, b'')
+                # Sempre envia ACK
+                ack_pkt = make_packet(TYPE_ACK, seq, b'')
                 sendto_via_channel(self.sock, ack_pkt, addr, self.channel)
-                print(f"[SR_Receiver] ACK enviado {seq_mod}.")
 
-                # Ignora pacotes duplicados já entregues
-                if seq_mod in self.buffer:
-                    continue
+                # Aceita se dentro da janela
+                if seq_in_range(seq, self.expected_seq % 256,
+                                (self.expected_seq + self.window_size) % 256):
+                    self.buffer[seq] = data
 
-                # Entrega se dentro da janela esperada
-                if seq_mod == (self.expected_seq % 256):
-                    self.buffer[seq_mod] = data
-                    while (self.expected_seq % 256) in self.buffer:
+                    # Entrega em ordem
+                    while self.expected_seq % 256 in self.buffer:
                         msg = self.buffer[self.expected_seq % 256]
                         self.delivered_data.append(msg)
-                        print(f"[SR_Receiver] Entregando pacote {self.expected_seq}.")
+                        if self.deliver_callback:
+                            self.deliver_callback(msg)  # <-- chama callback do simulador
                         del self.buffer[self.expected_seq % 256]
                         self.expected_seq += 1
-                else:
-                    # Armazena fora de ordem (selective repeat)
-                    if seq_in_range(seq_mod,
-                                    self.expected_seq % 256,
-                                    (self.expected_seq + self.window_size) % 256,
-                                    256):
-                        self.buffer[seq_mod] = data
+
+    def get_received_chunks(self):
+        return self.delivered_data.copy()
+
+    def close(self):
+        self.stop_event.set()
+        time.sleep(0.1)
+        try:
+            self.sock.close()
+        except Exception:
+            pass
