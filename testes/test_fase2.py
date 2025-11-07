@@ -236,8 +236,8 @@ def run_protocol_test(name, sender_cls, receiver_cls, total_chunks=1024, chunk_s
 
 def main():
     # Parâmetros do teste
-    total_chunks = 1024     # número de pacotes por teste
-    chunk_size = 1024        # tamanho de cada pacote em bytes
+    total_chunks = 1024    # número de pacotes por teste
+    chunk_size = 1024      # tamanho de cada pacote em bytes
     delay_range = (0.01, 0.05)
     loss_rate = 0.1
     verbose = False
@@ -252,7 +252,7 @@ def main():
                              window_size=1,
                              loss_rate=loss_rate,
                              delay_range=delay_range,
-                             verbose=verbose)
+                             verbose=True)
     results.append(rdt3)
 
     # === Go-Back-N ===
@@ -264,7 +264,7 @@ def main():
                                 window_size=N,
                                 loss_rate=loss_rate,
                                 delay_range=delay_range,
-                                verbose=verbose)
+                                verbose=True)
         results.append(res)
 
     # === Selective Repeat ===
