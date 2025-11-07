@@ -129,24 +129,34 @@ def instantiate_sender(sender_cls, dest_addr, channel, window_size: int, timeout
     raise last_exc
 
 
-def run_protocol_test(name, sender_cls, receiver_cls, total_chunks=1024, chunk_size=10,
+def run_protocol_test(name, sender_cls, receiver_cls, total_chunks=1024, chunk_size=1024,
                       window_size=1, loss_rate=0.1, delay_range=(0.01, 0.05), verbose=False):
     """
     Executa o teste de um protocolo confiável (RDT3, GBN ou SR) com canal não confiável.
-    Retorna estatísticas do teste.
+    Retorna estatísticas do teste e logs detalhados para SR.
     """
     # 1. Criar canal
     channel = UnreliableChannel(loss_rate=loss_rate, corrupt_rate=0.0, delay_range=delay_range, verbose=verbose)
 
     # 2. Lista para receber os dados
     received = []
-    def deliver(data):
-        received.append(data)
+
+    # Callback genérico para todos os protocolos
+    def deliver(*args):
+        """
+        - Para SR: deliver(seq, data)
+        - Para RDT3/GBN: deliver(data)
+        """
+        if len(args) == 2:
+            seq, data = args
+        else:
+            data = args[0]
+            seq = None
+        received.append((seq, data))
         if verbose:
-            print(f"[SR] Pacote recebido: {data}")  # log de recebimento
+            print(f"[DEBUG] Pacote recebido: seq={seq}, tamanho={len(data)}")
 
-
-    # 3. Criar receiver
+    # 3. Criar receiver e sender
     if name == "SR":
         receiver = receiver_cls(channel=channel, window_size=window_size, deliver_callback=deliver)
         receiver_port = receiver.sock.getsockname()[1]
@@ -163,24 +173,38 @@ def run_protocol_test(name, sender_cls, receiver_cls, total_chunks=1024, chunk_s
                             channel=channel, timeout=1.0, verbose=verbose)
 
     # 4. Criar os dados
-    data_chunks = [b'x'*chunk_size for _ in range(total_chunks)]
+    data_chunks = [bytes([i % 256])*chunk_size for i in range(total_chunks)]  # cada pacote distinto
+    packet_logs = []
 
     # 5. Enviar dados e medir tempo
     start = time.time()
-    if name == "RDT3":
-        # envia cada chunk separadamente para evitar TypeError
+    if name == "SR":
         for i, chunk in enumerate(data_chunks):
             sender.send(chunk)
+            packet_logs.append(f"[SR] Pacote enviado: seq={i}, tamanho={len(chunk)}")
             if verbose:
-                print(f"[SR] Pacote enviado ({i+1}/{len(data_chunks)}): {chunk}")   
+                print(packet_logs[-1])
     else:
         for chunk in data_chunks:
             sender.send(chunk)
 
-    time.sleep(1)  # espera ACKs finais
+    time.sleep(2)  # espera ACKs finais
     elapsed = max(time.time() - start, 0.000001)
 
     # 6. Estatísticas
+    ordered = True
+    if name == "SR":
+        # filtra pacotes válidos
+        received_dict = {seq: data for seq, data in received if seq is not None}
+        ordered = True
+        for i in range(total_chunks):
+            expected_data = data_chunks[i]
+            actual_data = received_dict.get(i)
+            if actual_data != expected_data:
+                ordered = False
+                if verbose:
+                    print(f"[ERRO] Pacote fora de ordem ou corrompido: seq={i}, esperado tamanho={len(expected_data)}, recebido tamanho={len(actual_data) if actual_data else 0}")
+
     delivered_count = len(received)
     total_data = chunk_size * total_chunks
     throughput = total_data / elapsed / 1e6  # MB/s
@@ -205,12 +229,15 @@ def run_protocol_test(name, sender_cls, receiver_cls, total_chunks=1024, chunk_s
         'throughput': throughput,
         'utilization': utilization,
         'retransmissions': retransmissions,
-        'received': delivered_count
+        'received': delivered_count,
+        'ordered': ordered,
+        'packet_logs': packet_logs
     }
+
 def main():
     # Parâmetros do teste
-    total_chunks = 10      # número de pacotes por teste
-    chunk_size = 25        # tamanho de cada pacote em bytes
+    total_chunks = 1024     # número de pacotes por teste
+    chunk_size = 1024        # tamanho de cada pacote em bytes
     delay_range = (0.01, 0.05)
     loss_rate = 0.1
     verbose = False

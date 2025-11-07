@@ -151,11 +151,12 @@ class SR_Receiver:
 
                     # Entrega em ordem
                     while self.expected_seq % 256 in self.buffer:
-                        msg = self.buffer[self.expected_seq % 256]
+                        seq_mod = self.expected_seq % 256
+                        msg = self.buffer[seq_mod]
                         self.delivered_data.append(msg)
                         if self.deliver_callback:
-                            self.deliver_callback(msg)  # <-- chama callback do simulador
-                        del self.buffer[self.expected_seq % 256]
+                            self.deliver_callback(seq_mod, msg)  # <-- envia seq junto
+                        del self.buffer[seq_mod]
                         self.expected_seq += 1
 
     def get_received_chunks(self):
