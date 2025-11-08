@@ -1,13 +1,9 @@
 """
 rdt30.py
-Implementação do rdt3.0: rdt2.1 + timer + perda de pacotes
-Timer implementado no lado do remetente, e modelo Stop-and-Wait.
-Simula perda de 15% dos pacotes DATA e ACKs, e atraso variável de 50-500 ms.
+Implementação do rdt3.0: rdt2.1 + timer + perda de pacotes.
+Stop-and-Wait com timer, simula perda de 15% dos pacotes DATA e ACKs,
+com atraso variável de 50-500 ms.
 
-Uso de exemplo:
-    - Rodar em terminais diferentes utilizando Git bash:
-        -> python -m fase1.rdt30 receiver --local-port 10000 --verbose
-        -> python -m fase1.rdt30 sender --local-port 0 --dest-port 10000 --verbose
 """
 
 import socket
@@ -16,20 +12,24 @@ import time
 import random
 import argparse
 from typing import Optional, Tuple, Callable
-from utils.packet import *  # Assumindo make_packet, parse_packet e constantes TYPE_DATA, TYPE_ACK, TYPE_NAK
+from utils.packet import *  # make_packet, parse_packet, TYPE_DATA, TYPE_ACK, TYPE_NAK
 
 
 class UnreliableChannel:
     """
-    Simula perda e atraso variável para pacotes e ACKs.
+    Canal que simula perda e atraso de pacotes DATA e ACKs.
     """
 
-    def __init__(self, loss_data=0.15, loss_ack=0.15, delay_range=(0.05, 0.5)):
+    def __init__(
+        self, loss_data: float = 0.15, loss_ack: float = 0.15, delay_range: Tuple[float, float] = (0.05, 0.5)
+    ):
         """
+        Inicializa parâmetros do canal.
+
         Args:
             loss_data (float): Probabilidade de perda de pacotes DATA.
             loss_ack (float): Probabilidade de perda de ACKs.
-            delay_range (tuple): Intervalo (s) de atraso para os pacotes.
+            delay_range (tuple): Intervalo de atraso (s) para os pacotes.
         """
         self.loss_data = loss_data
         self.loss_ack = loss_ack
@@ -37,13 +37,12 @@ class UnreliableChannel:
 
     def send(self, pkt: bytes, sock: socket.socket, addr: Tuple[str, int]):
         """
-        Envia pacotes com simulação de perda e atraso.
-        Identifica DATA/ACK pelo tipo no pacote.
+        Envia pacote simulando perda e atraso.
 
         Args:
-            pkt (bytes): Pacote pronto para envio.
-            sock (socket.socket): Socket UDP para envio.
-            addr (tuple): Endereço destino (host, porto).
+            pkt (bytes): Pacote a enviar.
+            sock (socket.socket): Socket UDP.
+            addr (tuple): Endereço destino (host, porta).
         """
         info = parse_packet(pkt)
         if info is None:
@@ -51,16 +50,16 @@ class UnreliableChannel:
 
         ptype = info['type']
 
-        # Decide se o pacote será perdido
+        # Simula perda
         if ptype == TYPE_DATA and random.random() < self.loss_data:
-            print("[CHANNEL] Perda simulada de pacote DATA")
-            return  # pacote perdido
+            print("[CHANNEL] Pacote DATA perdido")
+            return
 
         if ptype == TYPE_ACK and random.random() < self.loss_ack:
-            print("[CHANNEL] Perda simulada de ACK")
-            return  # ACK perdido
+            print("[CHANNEL] ACK perdido")
+            return
 
-        # Simula atraso variável
+        # Simula atraso
         delay = random.uniform(*self.delay_range)
 
         def delayed_send():
@@ -72,26 +71,26 @@ class UnreliableChannel:
 
 class RDT30Sender:
     """
-    Implementa o remetente rdt3.0 com timer e simulação de perda/atraso.
+    Remetente rdt3.0 (Stop-and-Wait) com timer e retransmissão automática.
     """
 
     def __init__(
         self,
-        local_addr=('localhost', 0),
-        dest_addr=('localhost', 10000),
+        local_addr: Tuple[str, int] = ('localhost', 0),
+        dest_addr: Tuple[str, int] = ('localhost', 10000),
         channel: Optional[UnreliableChannel] = None,
-        timeout=2.0,
-        verbose=True,
+        timeout: float = 2.0,
+        verbose: bool = True,
     ):
         """
-        Inicializa socket, timer e configura canal simulado.
+        Inicializa socket, timer e canal.
 
         Args:
-            local_addr (tuple): Endereço local para bind do socket.
-            dest_addr (tuple): Endereço destino dos pacotes.
-            channel (UnreliableChannel, opcional): Canal para simular perda e atraso.
-            timeout (float): Tempo de timeout (s) para retransmissão.
-            verbose (bool): Ativa mensagens de log.
+            local_addr (tuple): Endereço local (host, porta).
+            dest_addr (tuple): Endereço destino.
+            channel (UnreliableChannel, opcional): Canal simulado.
+            timeout (float): Timeout para retransmissão (s).
+            verbose (bool): Se True, exibe logs detalhados.
         """
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(local_addr)
@@ -106,17 +105,18 @@ class RDT30Sender:
         self.verbose = verbose
         self.timer = None
         self.running = True
-        self.start_time = None
+        self.start_time: Optional[float] = None
         self.bytes_sent = 0
 
+        # Thread para receber ACKs
         threading.Thread(target=self._recv_loop, daemon=True).start()
 
     def send(self, data: bytes):
         """
-        Envia dados garantindo confiabilidade via timer e retransmissões.
+        Envia dados de forma confiável usando timer e retransmissão.
 
         Args:
-            data (bytes): Dados a transmitir.
+            data (bytes): Dados a enviar.
         """
         with self.lock:
             pkt = make_packet(TYPE_DATA, self.seq, data)
@@ -144,19 +144,15 @@ class RDT30Sender:
                     self._start_timer()
 
     def _send_packet(self, pkt: bytes):
-        """
-        Envia o pacote via canal simulado ou socket direto.
-
-        Args:
-            pkt (bytes): Pacote a enviar.
-        """
+        """Envia pacote via canal simulado ou socket direto."""
         if self.channel:
             self.channel.send(pkt, self.sock, self.dest)
         else:
             self.sock.sendto(pkt, self.dest)
+
         if self.verbose:
             info = parse_packet(pkt)
-            print(f"[SENDER] Enviou pacote seq={info['seq']} len={len(pkt)}")
+            print(f"[SENDER] Pacote enviado seq={info['seq']} len={len(pkt)}")
 
     def _start_timer(self):
         """Inicia o timer para retransmissão."""
@@ -165,7 +161,7 @@ class RDT30Sender:
         self.timer.start()
 
     def _stop_timer(self):
-        """Para o timer se ativo."""
+        """Para o timer, se estiver ativo."""
         if self.timer:
             try:
                 self.timer.cancel()
@@ -174,11 +170,11 @@ class RDT30Sender:
             self.timer = None
 
     def _on_timeout(self):
-        """Callback chamado no timeout, força retransmissão."""
+        """Callback chamado no timeout, sinaliza que ACK não chegou."""
         self.waiting_for_ack.clear()
 
     def _recv_loop(self):
-        """Recebe pacotes ACK e verifica integridade e sequência."""
+        """Recebe ACKs e atualiza estado do protocolo."""
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(4096)
@@ -187,11 +183,7 @@ class RDT30Sender:
             info = parse_packet(data)
             if info is None:
                 continue
-            if (
-                info['type'] == TYPE_ACK
-                and not info['corrupt']
-                and info['seq'] == self.seq
-            ):
+            if info['type'] == TYPE_ACK and not info['corrupt'] and info['seq'] == self.seq:
                 if self.verbose:
                     print(f"[SENDER] Recebeu ACK seq {info['seq']}")
                 with self.lock:
@@ -200,14 +192,12 @@ class RDT30Sender:
             else:
                 if self.verbose:
                     print(
-                        "[SENDER] Ignorado pacote (type, corrupt, seq)=",
-                        info['type'],
-                        info['corrupt'],
-                        info['seq'],
+                        "[SENDER] Pacote ignorado (type, corrupt, seq)=",
+                        info['type'], info['corrupt'], info['seq']
                     )
 
     def close(self):
-        """Fecha o socket e para o remetente."""
+        """Encerra o remetente e fecha socket."""
         self.running = False
         self._stop_timer()
         try:
@@ -220,7 +210,7 @@ class RDT30Sender:
         Retorna estatísticas do envio.
 
         Returns:
-            tuple: (número de retransmissões, throughput em bytes por segundo)
+            tuple: (número de retransmissões, throughput bytes/s)
         """
         elapsed = time.time() - self.start_time if self.start_time else 0.0001
         throughput = self.bytes_sent / elapsed
@@ -229,24 +219,24 @@ class RDT30Sender:
 
 class RDT21Receiver:
     """
-    Receptor rdt2.1 (inalterado para rdt3.0).
+    Receptor rdt2.1 adaptado para rdt3.0 (Stop-and-Wait com ACK).
     """
 
     def __init__(
         self,
-        local_addr=('localhost', 10000),
+        local_addr: Tuple[str, int] = ('localhost', 10000),
         deliver_callback: Optional[Callable[[bytes], None]] = None,
         channel: Optional[UnreliableChannel] = None,
-        verbose=True,
+        verbose: bool = True,
     ):
         """
-        Configura socket e parâmetros.
+        Inicializa socket, estado e canal.
 
         Args:
             local_addr (tuple): Endereço local para bind.
             deliver_callback (callable, opcional): Função para entrega dos dados.
-            channel (UnreliableChannel, opcional): Canal para simulação.
-            verbose (bool): Para logs detalhados.
+            channel (UnreliableChannel, opcional): Canal simulado.
+            verbose (bool): Se True, exibe logs detalhados.
         """
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(local_addr)
@@ -258,7 +248,7 @@ class RDT21Receiver:
         threading.Thread(target=self._recv_loop, daemon=True).start()
 
     def _send_ack(self, seq: int, addr: Tuple[str, int]):
-        """Envia ACK dado um número de sequência."""
+        """Envia ACK para número de sequência fornecido."""
         pkt = make_packet(TYPE_ACK, seq, b'')
         if self.channel:
             self.channel.send(pkt, self.sock, addr)
@@ -268,7 +258,7 @@ class RDT21Receiver:
             print(f"[RECV] Enviou ACK {seq}")
 
     def _recv_loop(self):
-        """Loop para receber pacotes DATA, entregá-los e enviar ACKs."""
+        """Recebe pacotes DATA, entrega à aplicação e envia ACKs."""
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(65536)
@@ -277,6 +267,7 @@ class RDT21Receiver:
             info = parse_packet(data)
             if info is None:
                 continue
+
             if info['type'] == TYPE_DATA:
                 if not info['corrupt'] and info['seq'] == self.expected:
                     if self.verbose:
@@ -285,7 +276,7 @@ class RDT21Receiver:
                     self._send_ack(self.expected, addr)
                     self.expected = 1 - self.expected
                 else:
-                    # Pacote duplicado ou corrompido: re-ACK último correto
+                    # Pacote duplicado ou corrompido, re-ACK último correto
                     if self.verbose:
                         print(f"[RECV] Pacote duplicado/corrompido seq {info['seq']} -> re-ACK {1 - self.expected}")
                     self._send_ack(1 - self.expected, addr)
@@ -300,16 +291,18 @@ class RDT21Receiver:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="rdt3.0 protocol with timer and loss simulation")
-    parser.add_argument("role", choices=["sender", "receiver"], help="Função para executar: sender ou receiver")
+    """Função principal para executar sender ou receiver via linha de comando."""
+    parser = argparse.ArgumentParser(description="rdt3.0 com timer e simulação de perda")
+    parser.add_argument("role", choices=["sender", "receiver"], help="Função: sender ou receiver")
     parser.add_argument("--local-host", default="localhost", help="Host local")
-    parser.add_argument("--local-port", type=int, default=0, help="Porta local (0 para aleatória no sender, 10000 padrão receiver)")
-    parser.add_argument("--dest-host", default="localhost", help="Host destino para sender")
-    parser.add_argument("--dest-port", type=int, default=10000, help="Porta destino para sender")
+    parser.add_argument("--local-port", type=int, default=0, help="Porta local")
+    parser.add_argument("--dest-host", default="localhost", help="Host destino (sender)")
+    parser.add_argument("--dest-port", type=int, default=10000, help="Porta destino (sender)")
     parser.add_argument("--verbose", action="store_true", help="Ativa logs detalhados")
 
     args = parser.parse_args()
 
+    # Cria canal com perda e atraso simulados
     channel = UnreliableChannel(loss_data=0.15, loss_ack=0.15, delay_range=(0.05, 0.5))
 
     if args.role == "receiver":
@@ -317,7 +310,6 @@ def main():
             print(f"[RECEIVER] Mensagem recebida: {data.decode(errors='replace')}")
 
         local_port = args.local_port if args.local_port != 0 else 10000
-
         receiver = RDT21Receiver(
             local_addr=(args.local_host, local_port),
             deliver_callback=deliver,
@@ -339,14 +331,11 @@ def main():
             channel=channel,
             verbose=args.verbose,
         )
-
         messages = [f"Mensagem {i}" for i in range(10)]
-
         for msg in messages:
             print(f"[SENDER] Enviando: {msg}")
             sender.send(msg.encode())
             time.sleep(0.1)
-
         sender.close()
         print("Remetente finalizado.")
 
