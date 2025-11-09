@@ -1,32 +1,38 @@
+# fase2/gbn.py
 """
-fase2/gbn.py
-Implementação Go-Back-N (GBN) sobre UDP usando janela de envio N e ACKs cumulativos.
-Classes: GBNSender, GBNReceiver.
+Go-Back-N (GBN) compatível com o simulator UnreliableChannel.
+
+Uso de seqnum absoluto internamente; o campo de seq no pacote ocupa 1 byte (0..255),
+logo colocamos seq % 256 no pacote. Para mapear ACKs (que vêm modulo 256) para
+o seq absoluto correto, procuramos dentro da janela base..nextseq-1.
 """
 
 import socket
 import threading
 import time
-from utils.packet import *
+from utils.packet import make_packet, parse_packet, TYPE_DATA, TYPE_ACK
+
 
 class GBNSender:
     """
-    Remetente Go-Back-N com janela N e ACKs cumulativos.
-    Gerencia o envio, retransmissão e janela.
+    Implementa o transmissor Go-Back-N (GBN).
+
+    Mantém janela deslizante, retransmissão por timeout e mapeamento
+    de ACKs modulo 256 para sequência absoluta.
     """
 
     def __init__(self, local_addr=('localhost', 0), dest_addr=('localhost', 14000),
                  channel=None, N=5, timeout=2.0, verbose=True):
         """
-        Inicializa o sender GBN.
+        Inicializa o transmissor GBN.
 
         Args:
-            local_addr (tuple): Endereço local p/ bind.
-            dest_addr (tuple): Endereço do receptor.
-            channel (UnreliableChannel): Canal para simulação (opcional).
-            N (int): Tamanho da janela de envio.
-            timeout (float): Timeout para retransmissão.
-            verbose (bool): Se True, mostra logs detalhados.
+            local_addr (tuple): Endereço local (host, port) do socket.
+            dest_addr (tuple): Endereço do receptor (host, port).
+            channel: Canal alternativo de envio (opcional).
+            N (int): Tamanho da janela.
+            timeout (float): Timeout em segundos para retransmissão.
+            verbose (bool): Habilita prints detalhados.
         """
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(local_addr)
@@ -38,7 +44,7 @@ class GBNSender:
         self.nextseq = 0
         self.lock = threading.Lock()
         self.timer = None
-        self.buffer = {}
+        self.buffer = {}  # buffer[seq_abs] = pkt_bytes
         self.running = True
         self.verbose = verbose
         self.retransmissions = 0
@@ -46,11 +52,10 @@ class GBNSender:
 
     def send(self, data: bytes):
         """
-        Envia dados usando o protocolo GBN.
-        Aguarda janela disponível para inserir o novo pacote.
+        Envia UM pacote (pode ser chamado repetidamente para sequência de pacotes).
 
         Args:
-            data (bytes): Dados para transmissão.
+            data (bytes): Payload do pacote a ser enviado.
         """
         with self.lock:
             while self.nextseq >= self.base + self.N:
@@ -59,64 +64,60 @@ class GBNSender:
                 self.lock.release()
                 time.sleep(0.01)
                 self.lock.acquire()
-            seq = self.nextseq
-            pkt = make_packet(TYPE_DATA, seq, data)
-            self.buffer[seq] = pkt
-            self._send_packet(pkt)
+
+            seq_abs = self.nextseq
+            seq_field = seq_abs % 256
+            pkt = make_packet(TYPE_DATA, seq_field, data)
+            self.buffer[seq_abs] = pkt
+
+            self._send_packet_bytes(pkt)
+
+            if self.verbose:
+                print(f'[GBN SENDER] Sent seq_abs={seq_abs} mod={seq_field} len={len(pkt)}')
+
             if self.base == self.nextseq:
-                self._start_timer()
+                self._start_timer()  # inicia timer quando o primeiro pacote surge
+
             self.nextseq += 1
 
-    def _send_packet(self, pkt: bytes):
-        """
-        Envia um pacote usando canal simulado ou diretamente.
-
-        Args:
-            pkt (bytes): Pacote a enviar.
-        """
+    def _send_packet_bytes(self, pkt):
+        """Envia bytes do pacote via canal ou socket padrão."""
         if self.channel:
             self.channel.send(pkt, self.sock, self.dest)
         else:
             self.sock.sendto(pkt, self.dest)
-        if self.verbose:
-            info = parse_packet(pkt)
-            print('[GBN SENDER] Sent seq =', info['seq'])
 
     def _start_timer(self):
-        """
-        Inicia o timer para retransmissão dos pacotes em janela.
-        """
+        """Inicia o timer de retransmissão."""
         self._stop_timer()
         self.timer = threading.Timer(self.timeout, self._on_timeout)
         self.timer.start()
 
     def _stop_timer(self):
-        """
-        Para e limpa o timer ativo, se existir.
-        """
+        """Para o timer de retransmissão."""
         try:
             if self.timer:
                 self.timer.cancel()
+                self.timer = None
         except Exception:
             pass
 
     def _on_timeout(self):
-        """
-        Callback do timeout. Retransmite todos os pacotes não confirmados.
-        """
+        """Callback do timeout: retransmite todos os pacotes pendentes."""
         with self.lock:
             if self.verbose:
-                print('[GBN SENDER] Timeout: retransmitting from base', self.base)
+                print(f'[GBN SENDER] Timeout! Retransmitindo janela a partir de base={self.base}')
             for seq in range(self.base, self.nextseq):
-                pkt = self.buffer[seq]
-                self._send_packet(pkt)
-                self.retransmissions += 1
-            self._start_timer()
+                pkt = self.buffer.get(seq)
+                if pkt:
+                    self._send_packet_bytes(pkt)
+                    self.retransmissions += 1
+                    if self.verbose:
+                        print(f'[GBN SENDER] Retransmit seq_abs={seq} mod={seq % 256}')
+            self._start_timer()  # reinicia o timer após retransmitir
 
     def _recv_loop(self):
-        """
-        Loop do remetente: escuta e processa ACKs cumulativos.
-        """
+        """Recebe ACKs e avança a base conforme confirmação cumulativa."""
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(65536)
@@ -125,22 +126,44 @@ class GBNSender:
             info = parse_packet(data)
             if info is None:
                 continue
+
             if info['type'] == TYPE_ACK and not info['corrupt']:
-                acknum = info['seq']
+                ack_mod = info['seq']  # 0..255
                 with self.lock:
+                    mapped = None
+                    # Mapeia ACK modulo 256 para sequência absoluta
+                    for seq in range(self.base, self.nextseq):
+                        if (seq % 256) == ack_mod:
+                            mapped = seq
+
+                    if mapped is None:
+                        if self.verbose:
+                            print(f'[GBN SENDER] ACK {ack_mod} fora da janela base={self.base}')
+                        continue
+
                     if self.verbose:
-                        print('[GBN SENDER] Received ACK', acknum)
-                    self.base = acknum + 1
+                        print(f'[GBN SENDER] ACK {ack_mod} -> seq_abs {mapped}')
+
+                    old_base = self.base
+                    self.base = mapped + 1
+
+                    # Remove pacotes confirmados
+                    for s in list(self.buffer.keys()):
+                        if s < self.base:
+                            del self.buffer[s]
+
+                    # Se todos confirmados, parar timer
                     if self.base == self.nextseq:
                         self._stop_timer()
-                    else:
+                    elif self.base > old_base and self.timer is None:
                         self._start_timer()
 
     def close(self):
-        """
-        Finaliza sockets e encerra threads do sender.
-        """
+        """Fecha o socket após garantir envio completo."""
+        while self.base < self.nextseq and self.running:
+            time.sleep(0.05)
         self.running = False
+        self._stop_timer()
         try:
             self.sock.close()
         except Exception:
@@ -149,19 +172,21 @@ class GBNSender:
 
 class GBNReceiver:
     """
-    Receptor Go-Back-N que entrega dados na ordem e envia ACKs cumulativos.
+    Implementa o receptor Go-Back-N (GBN).
+
+    Recebe pacotes DATA, envia ACKs cumulativos e entrega payloads em ordem.
     """
 
     def __init__(self, local_addr=('localhost', 14000), deliver_callback=None,
                  channel=None, verbose=True):
         """
-        Inicializa receptor e configura processamento de dados.
+        Inicializa o receptor GBN.
 
         Args:
-            local_addr (tuple): Endereço local do receptor.
-            deliver_callback (callable): Função para entrega dos dados.
-            channel (UnreliableChannel): Canal simulado (opcional).
-            verbose (bool): Se True, mostra logs detalhados.
+            local_addr (tuple): Endereço local (host, port) do socket.
+            deliver_callback (callable): Função chamada ao receber payload válido.
+            channel: Canal alternativo de envio de ACKs (opcional).
+            verbose (bool): Habilita prints detalhados.
         """
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(local_addr)
@@ -172,26 +197,24 @@ class GBNReceiver:
         self.verbose = verbose
         threading.Thread(target=self._recv_loop, daemon=True).start()
 
-    def _send_ack(self, seq, addr):
+    def _send_ack(self, seq_field, addr):
         """
         Envia ACK cumulativo para o remetente.
 
         Args:
-            seq (int): Número de sequência a confirmar.
-            addr (tuple): Endereço para envio do ACK.
+            seq_field (int): Número de sequência do ACK (mod 256).
+            addr (tuple): Endereço de destino.
         """
-        pkt = make_packet(TYPE_ACK, seq, b'')
+        pkt = make_packet(TYPE_ACK, seq_field, b'')
         if self.channel:
             self.channel.send(pkt, self.sock, addr)
         else:
             self.sock.sendto(pkt, addr)
         if self.verbose:
-            print('[GBN RECV] Sent ACK', seq)
+            print(f'[GBN RECV] Sent ACK {seq_field}')
 
     def _recv_loop(self):
-        """
-        Loop principal do receptor: recebe dados, entrega na ordem ou descarta e reenvia ACK.
-        """
+        """Loop de recebimento que processa pacotes DATA e envia ACKs."""
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(65536)
@@ -200,22 +223,32 @@ class GBNReceiver:
             info = parse_packet(data)
             if info is None:
                 continue
+
             if info['type'] == TYPE_DATA:
-                if not info['corrupt'] and info['seq'] == self.expected:
+                if info['corrupt']:
                     if self.verbose:
-                        print('[GBN RECV] Received expected seq', info['seq'])
+                        print('[GBN RECV] Packet corrupt, resend last ACK.')
+                    last_ack = (self.expected - 1) % 256
+                    self._send_ack(last_ack, addr)
+                    continue
+
+                recv_seq = info['seq']
+                if recv_seq == (self.expected % 256):
+                    if self.verbose:
+                        print(f'[GBN RECV] Got expected seq={recv_seq}')
                     self.deliver_callback(info['payload'])
-                    self._send_ack(self.expected, addr)
+                    self._send_ack(recv_seq, addr)
                     self.expected += 1
                 else:
+                    # Fora de ordem → reenvia último ACK válido
+                    last_ack = (self.expected - 1) % 256
                     if self.verbose:
-                        print('[GBN RECV] Received unexpected/corrupt seq', info['seq'], 'expected', self.expected)
-                    self._send_ack(self.expected - 1 if self.expected > 0 else 0, addr)
+                        print(f'[GBN RECV] Out-of-order seq={recv_seq}, expected={self.expected % 256}. '
+                              f'Re-ACK {last_ack}')
+                    self._send_ack(last_ack, addr)
 
     def close(self):
-        """
-        Finaliza sockets e encerra loop da thread receptor.
-        """
+        """Fecha o socket do receptor."""
         self.running = False
         try:
             self.sock.close()
